@@ -1,14 +1,8 @@
 # CoLLiE
 
-A Light Toolkit to Finetune Large Language Models.
+Full Parameter Fine-tuning of Large Language Models on Consumer Hardware.
 
 ## Beta release (0.0.1)
-
-Requirements:
-
-* CUDA 11.8 
-* PyTorch 1.13.1
-* Python 3.8
 
 To install:
 
@@ -16,25 +10,21 @@ To install:
 python setup.py install
 ```
 
-## Features
-1. Utilizes Colossal-AI's pipeline parallelism mode (requires installing [Colossal-AI](https://github.com/hpcaitech/ColossalAI)).
-2. Replaces the original attention structure with flash-attention (requires installing [flash-attn](https://github.com/HazyResearch/flash-attention)).
-3. Replaces the original dense layer with fused-dense (requires installing [fused_dense_lib](https://github.com/HazyResearch/flash-attention/tree/main/csrc/fused_dense_lib)).
-4. Replaces the original rotary position encoding with rotary_emb (requires installing [rotary_emb](https://github.com/HazyResearch/flash-attention/tree/main/csrc/rotary)).
-5. Employs fairscale's tensor parallelism mode (requires installing [fairscale](https://github.com/facebookresearch/fairscale)).
-6. Utilizes deepspeed's ZeRO (requires installing [deepspeed](https://github.com/microsoft/DeepSpeed)).
-7. Support Inplace SGD.
+## Speed Benchmark
 
-## Roadmap
+### Throughput when training LLaMA with CoLLiE
 
-+ [x] Utilizes Colossal-AI's pipeline parallelism.
-+ [x] Utilizes FairScale's tensor parallelism.
-+ [x] Utilizes Deepspeed's ZeRO.
-+ [x] Implement Inplace SGD.
-+ [x] Reimplement LlaMA with Colossal-AI APIs.
-+ [ ] Support Colossal-AI's tensor parallelism and ZeRO CPU offload.
-+ [ ] Speed Benchmark.
-+ [ ] Add more examples.
+| Model Size | Parallel |  Optimizer  |   Hardware   | Seq. Length | Batch Size | Sec. per Step |  TGS  |
+|:----------:|:--------:|:-----------:|:------------:|:-----------:|:----------:|:-------------:|:-----:|
+|     7B     | Pipeline |     SGD     | 8 * RTX 3090 |    1024     |    128     |     31.0      | 528.5 |
+|     7B     |  ZeRO-3  | Inplace SGD | 1 * RTX 3090 |    1024     |     3      |      4.0      | 832.5 |
+|    13B     | Pipeline |     SGD     | 8 * RTX 3090 |    1024     |    128     |     47.0      | 348.5 |
+|    13B     |  ZeRO-3  | Inplace SGD | 2 * RTX 3090 |    1024     |     4      |     11.7      | 350.1 |
+|    30B     |  ZeRO-3  | Inplace SGD | 4 * RTX 3090 |     960     |     2      |     34.1      | 56.4  |
+|    65B     |  ZeRO-3  | Inplace SGD | 8 * RTX 3090 |     512     |     2      |     67.1      | 15.3  |
+
+
+<font size=2>* TGS = **T**okens / **G**PU / **S**econd</font>
 
 ## How to use CoLLiE
 
@@ -169,3 +159,24 @@ trainer.train()
 ```
 
 For more examples, check [CoLLiE Examples](https://github.com/OpenLMLab/collie/tree/main/examples).
+
+## Features
+
+1. Utilizes Colossal-AI's pipeline parallelism mode (requires installing [Colossal-AI](https://github.com/hpcaitech/ColossalAI)).
+2. Replaces the original attention structure with flash-attention (requires installing [flash-attn](https://github.com/HazyResearch/flash-attention)).
+3. Replaces the original dense layer with fused-dense (requires installing [fused_dense_lib](https://github.com/HazyResearch/flash-attention/tree/main/csrc/fused_dense_lib)).
+4. Replaces the original rotary position encoding with rotary_emb (requires installing [rotary_emb](https://github.com/HazyResearch/flash-attention/tree/main/csrc/rotary)).
+5. Employs fairscale's tensor parallelism mode (requires installing [fairscale](https://github.com/facebookresearch/fairscale)).
+6. Utilizes deepspeed's ZeRO (requires installing [deepspeed](https://github.com/microsoft/DeepSpeed)).
+7. Support Inplace SGD.
+
+## Roadmap
+
++ [x] Utilizes Colossal-AI's pipeline parallelism.
++ [x] Utilizes FairScale's tensor parallelism.
++ [x] Utilizes Deepspeed's ZeRO.
++ [x] Implement Inplace SGD.
++ [x] Reimplement LlaMA with Colossal-AI APIs.
++ [x] Speed Benchmark.
++ [ ] Support Colossal-AI's tensor parallelism and ZeRO CPU offload.
++ [ ] Add more examples.

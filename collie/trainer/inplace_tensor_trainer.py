@@ -1,6 +1,7 @@
 import operator
 
 import tqdm
+from itertools import chain
 import torch
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import RandomSampler, SequentialSampler, DataLoader
@@ -54,6 +55,9 @@ class InplaceTensorTrainer:
                                                   schedule=self.collie_args.lr_scheduler_type,
                                                   n_steps=self.n_steps)
         self.lr = 0
+        self.gather_norm = False
+        self.grad_norms = []
+        self.clip_coef = None
 
         # register inplace grad hook
         self.grad_func = self.inplace_grad()
@@ -67,11 +71,17 @@ class InplaceTensorTrainer:
             with torch.no_grad():
                 for n, p in self.model.named_parameters():
                     if p.requires_grad and p.grad is not None:
-                        if self.collie_args.clip_grad_value is not None:
-                            # Gradients are modified in-place.
-                            p.grad.data.clamp_(min=-self.collie_args.clip_grad_value, max=self.collie_args.clip_grad_value)
-                        p.data -= (self.lr * p.grad.data)
-                        p.grad = None
+                        if self.gather_norm:
+                            self.grad_norms.append(torch.norm(p.grad, 2.0))
+                            p.grad = None
+                        else:
+                            if self.collie_args.clip_grad_value is not None and self.collie_args.clip_grad_value > 0:
+                                # Gradients are modified in-place.
+                                p.grad.data.clamp_(min=-self.collie_args.clip_grad_value, max=self.collie_args.clip_grad_value)
+                            if self.collie_args.clip_grad_norm is not None and self.collie_args.clip_grad_norm > 0 and self.clip_coef is not None:
+                                p.grad.data.mul_(self.clip_coef)
+                            p.data -= (self.lr * p.grad.data)
+                            p.grad = None
             return x
 
         return func
@@ -108,10 +118,31 @@ class InplaceTensorTrainer:
                     # update the learning rate
                     self.global_step = self.num_steps_per_epoch * epoch + step
                     self.lr = self.lr_scheduler.step(self.global_step)
-                    loss.backward()
+                    if self.collie_args.clip_grad_norm is not None and self.collie_args.clip_grad_norm > 0:
+                        self.gather_norm = True
+                        self.grad_norms = []
 
+                        loss.backward(retain_graph=True)
+                        # update the last one since the hook function will not be called for the last parameter
+                        self.grad_func(0)
+
+                        with torch.no_grad():
+                            # The norm is computed over all gradients together, as if they were
+                            # concatenated into a single vector. Gradients are modified in-place.
+                            self.grad_norms = torch.stack(self.grad_norms)
+                            device = torch.device(f"cuda:{self.collie_args.local_rank}")
+                            all_grad_norms = torch.zeros(self.collie_args.world_size * self.grad_norms.shape[0], dtype=self.grad_norms.dtype, device=device)
+                            torch.distributed.all_gather_into_tensor(all_grad_norms, self.grad_norms)
+
+                            total_norm = torch.norm(all_grad_norms, 2.0)
+                            self.clip_coef = float(self.collie_args.clip_grad_norm) / (total_norm + 1e-6)
+                            self.clip_coef = torch.clamp(self.clip_coef, max=1.0)
+                        self.gather_norm = False
+
+                    loss.backward()
                     # update the last one since the hook function will not be called for the last parameter
                     self.grad_func(0)
+
                     tqb.set_postfix({'loss': loss.item()})
                     if self.allow_print:
                         self.wandb.log(

@@ -25,6 +25,9 @@ class TrainerArgs:
         metadata={"help": "Total number of training epochs to perform. "
                   "If it is set to -1, the training will run forever."
                   "If it is set to 0, the training will not run."})
+    learning_rate: int = field(
+        default=1e-3,
+        metadata={"help": "Learning rate of training."})
     eval_per_steps: int = field(
         default=10,
         metadata={"help": "The number of steps to perform evaluation. " 
@@ -59,6 +62,7 @@ class ColossalaiTrainer:
                  tokenizer,
                  train_dataloader,
                  eval_dataloader,
+                 lr_scheduler = None,
                  compute_metrics = None,
                  trainer_args: TrainerArgs = TrainerArgs()) -> None:
         self.model = model
@@ -66,6 +70,7 @@ class ColossalaiTrainer:
         self.compute_metrics = compute_metrics
         self.trainer_args = trainer_args
         self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
         self.engine, self.train_dataloader, self.eval_dataloader, _ = colossalai.initialize(
             model=self.model,
             train_dataloader=train_dataloader,
@@ -86,6 +91,8 @@ class ColossalaiTrainer:
                         return_output_label=False,
                     )
                     self.engine.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
                     if gpc.is_pipeline_last_stage():
                         tqb.set_postfix({'epoch': epoch, 'step': step, 'loss': loss.item()})
                     if self.trainer_args.eval_per_steps == 0:
@@ -145,27 +152,24 @@ class ColossalaiTrainer:
                         return_loss=False,
                         return_output_label=True,
                     )
+                    torch.cuda.empty_cache()
                     cached_len = current_pos
                     next_tokens_list = [torch.full((input_ids.shape[0], 1), -1, dtype=torch.long, device=torch.device(f"cuda:{os.environ['LOCAL_RANK']}")) for _ in range(int(os.environ.get("WORLD_SIZE")))]
                     if gpc.is_pipeline_last_stage():
-                        # if os.environ.get('LOCAL_RANK', '0') == '7':
-                        #     import pdb
-                        #     pdb.set_trace()
                         # top-p分布
-                        # scores = hidden_states[:,-1,:]
-                        # sorted_logits, sorted_indicies = torch.sort(scores, descending=True)
-                        # cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-                        # sorted_indices_to_remove = cumulative_probs > self.trainer_args.eval_top_p
-                        # sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        # sorted_indices_to_remove[..., 0] = 0
-                        # indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indicies, sorted_indices_to_remove)
-                        # scores = scores.masked_fill(indices_to_remove, -float('inf'))
-                        # # 温度采样
-                        # scores = torch.exp(scores / self.trainer_args.eval_temperature)
-                        # scores = scores / torch.sum(scores)
-                        next_tokens_list[int(os.environ.get("RANK"))] = torch.argmax(hidden_states[:, -1, :], dim=-1)
+                        scores = hidden_states[:,-1,:]
+                        sorted_logits, sorted_indicies = torch.sort(scores, descending=True)
+                        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                        sorted_indices_to_remove = cumulative_probs > self.trainer_args.eval_top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indicies, sorted_indices_to_remove)
+                        scores = scores.masked_fill(indices_to_remove, -float('inf'))
+                        # 温度采样
+                        scores = torch.nn.functional.softmax(scores / self.trainer_args.eval_temperature, dim=-1)
+                        # next_tokens_list[int(os.environ.get("RANK"))] = torch.argmax(hidden_states[:, -1, :], dim=-1)
                         
-                        # next_tokens = torch.multinomial(scores, num_samples=1).squeeze(1)
+                        next_tokens_list[int(os.environ.get("RANK"))] = torch.multinomial(scores, num_samples=1).squeeze(1)
                         next_tokens_list[int(os.environ.get("RANK"))] = torch.unsqueeze(next_tokens_list[int(os.environ.get("RANK"))], dim=-1)
                     torch.distributed.all_gather(next_tokens_list, next_tokens_list[int(os.environ.get("RANK"))])
                     next_tokens = next_tokens_list[0]
@@ -174,8 +178,11 @@ class ColossalaiTrainer:
                             next_tokens = next_tokens_list[i]
                             break
                     next_tokens = next_tokens.to(input_ids.device)
-                    input_ids[active_batch_idx, current_pos] = torch.where(input_ids[active_batch_idx, current_pos] == 0, next_tokens[active_batch_idx, 0],
-                                                                           input_ids[active_batch_idx, current_pos])
+                    input_ids[active_batch_idx, current_pos] = torch.where(
+                        input_ids[active_batch_idx, current_pos] == 0,
+                        next_tokens[active_batch_idx, 0],
+                        input_ids[active_batch_idx, current_pos]
+                    )
                     tqb.set_postfix({'generating': f"{current_pos}/{max_length}"})
                     # check if can stop generate using stop_generate_flag_vector
                     for stop_token in stop_tokens:
@@ -188,6 +195,14 @@ class ColossalaiTrainer:
                     torch.cuda.empty_cache()
                 except StopIteration:
                     break
+        # clean caches for key & value
+        try:
+            _ = [block.clean_cache() for block in self.engine.model.blocks]
+        except AttributeError:
+            try:
+                _ = [block.clean_cache() for block in self.engine.model.model.blocks]
+            except AttributeError:
+                pass
         return input_ids
 
     def eval(self, epoch=0, step=0):
@@ -196,10 +211,12 @@ class ColossalaiTrainer:
                 input_dict = batch[0]
                 label = batch[1]
                 with torch.no_grad():
-                    input_dict['input_ids'] = self.generate(input_dict['input_ids'],
-                                                            max_length=self.trainer_args.eval_max_length,
-                                                            stop_tokens=self.trainer_args.eval_stop_tokens,
-                                                            use_cache=self.trainer_args.eval_use_cache)
+                    input_dict['input_ids'] = self.generate(
+                        input_dict['input_ids'],
+                        max_length=self.trainer_args.eval_max_length,
+                        stop_tokens=self.trainer_args.eval_stop_tokens,
+                        use_cache=self.trainer_args.eval_use_cache
+                    )
                     torch.cuda.empty_cache()
                     if gpc.is_pipeline_last_stage() and gpc.get_local_rank(ParallelMode.TENSOR) == gpc.get_world_size(ParallelMode.TENSOR) - 1 and self.compute_metrics is not None:
                         self.compute_metrics((input_dict, label), epoch, step)
